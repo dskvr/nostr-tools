@@ -2,6 +2,8 @@
 
 Tools for developing [Nostr](https://github.com/fiatjaf/nostr) clients.
 
+Only depends on _@scure_ and _@noble_ packages.
+
 ## Usage
 
 ### Generating a private key and a public key
@@ -28,15 +30,15 @@ let event = {
   kind: 1,
   created_at: Math.floor(Date.now() / 1000),
   tags: [],
-  content: 'hello'
+  content: 'hello',
+  pubkey: getPublicKey(privateKey)
 }
 
-event.id = getEventHash(event.id)
-event.pubkey = getPublicKey(privateKey)
-event.sig = await signEvent(event, privateKey)
+event.id = getEventHash(event)
+event.sig = signEvent(event, privateKey)
 
 let ok = validateEvent(event)
-let veryOk = await verifySignature(event)
+let veryOk = verifySignature(event)
 ```
 
 ### Interacting with a relay
@@ -51,7 +53,7 @@ import {
 } from 'nostr-tools'
 
 const relay = relayInit('wss://relay.example.com')
-relay.connect()
+await relay.connect()
 
 relay.on('connect', () => {
   console.log(`connected to ${relay.url}`)
@@ -96,20 +98,26 @@ let event = {
   content: 'hello world'
 }
 event.id = getEventHash(event)
-event.sig = await signEvent(event, sk)
+event.sig = signEvent(event, sk)
 
 let pub = relay.publish(event)
 pub.on('ok', () => {
-  console.log(`{relay.url} has accepted our event`)
+  console.log(`${relay.url} has accepted our event`)
 })
 pub.on('seen', () => {
-  console.log(`we saw the event on {relay.url}`)
+  console.log(`we saw the event on ${relay.url}`)
 })
 pub.on('failed', reason => {
-  console.log(`failed to publish to {relay.url}: ${reason}`)
+  console.log(`failed to publish to ${relay.url}: ${reason}`)
 })
 
 await relay.close()
+```
+
+To use this on Node.js you first must install `websocket-polyfill` and import it:
+
+```js
+import 'websocket-polyfill'
 ```
 
 ### Querying profile data from a NIP-05 address
@@ -122,8 +130,11 @@ console.log(profile.pubkey)
 // prints: 32e1827635450ebb3c5a7d12c1f8e7b2b514439ac10a67eef3d9fd9c5c68e245
 console.log(profile.relays)
 // prints: [wss://relay.damus.io]
+```
 
-// on nodejs, install node-fetch@2 and call this first:
+To use this on Node.js you first must install `node-fetch@2` and call something like this:
+
+```js
 nip05.useFetchImplementation(require('node-fetch'))
 ```
 
@@ -171,7 +182,7 @@ let pk2 = getPublicKey(sk2)
 
 // on the sender side
 let message = 'hello'
-let ciphertext = nip04.encrypt(sk1, pk2, 'hello')
+let ciphertext = await nip04.encrypt(sk1, pk2, message)
 
 let event = {
   kind: 4,
@@ -185,10 +196,45 @@ sendEvent(event)
 
 // on the receiver side
 sub.on('event', (event) => {
-  let sender = event.tags.find(([k, v]) => k === 'p' && && v && v !== '')[1]
+  let sender = event.tags.find(([k, v]) => k === 'p' && v && v !== '')[1]
   pk1 === sender
-  let plaintext = nip04.decrypt(sk2, pk1, event.content)
+  let plaintext = await nip04.decrypt(sk2, pk1, event.content)
 })
+```
+
+### Performing and checking for delegation
+
+```js
+import {nip26, getPublicKey, generatePrivateKey} from 'nostr-tools'
+
+// delegator
+let sk1 = generatePrivateKey()
+let pk1 = getPublicKey(sk1)
+
+// delegatee
+let sk2 = generatePrivateKey()
+let pk2 = getPublicKey(sk2)
+
+// generate delegation
+let delegation = nip26.createDelegation(sk1, {
+  pubkey: pk2,
+  kind: 1,
+  since: Math.round(Date.now() / 1000),
+  until: Math.round(Date.now() / 1000) + 60 * 60 * 24 * 30 /* 30 days */
+})
+
+// the delegatee uses the delegation when building an event
+let event = {
+  pubkey: pk2,
+  kind: 1,
+  created_at: Math.round(Date.now() / 1000),
+  content: 'hello from a delegated key',
+  tags: [['delegation', delegation.from, delegation.cond, delegation.sig]]
+}
+
+// finally any receiver of this event can check for the presence of a valid delegation tag
+let delegator = nip26.getDelegator(event)
+assert(delegator === pk1) // will be null if there is no delegation tag or if it is invalid
 ```
 
 Please consult the tests or [the source code](https://github.com/fiatjaf/nostr-tools) for more information that isn't available here.

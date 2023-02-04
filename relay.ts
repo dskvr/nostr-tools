@@ -1,19 +1,20 @@
 /* global WebSocket */
 
-import 'websocket-polyfill'
-
 import {Event, verifySignature, validateEvent} from './event'
 import {Filter, matchFilters} from './filter'
+import {getHex64} from './fakejson'
+
+type RelayEvent = 'connect' | 'disconnect' | 'error' | 'notice'
 
 export type Relay = {
   url: string
   status: number
-  connect: () => void
-  close: () => void
-  sub: (filters: Filter[], opts: SubscriptionOptions) => Sub
+  connect: () => Promise<void>
+  close: () => Promise<void>
+  sub: (filters: Filter[], opts?: SubscriptionOptions) => Sub
   publish: (event: Event) => Pub
-  on: (type: 'connect' | 'disconnect' | 'notice', cb: any) => void
-  off: (type: 'connect' | 'disconnect' | 'notice', cb: any) => void
+  on: (type: RelayEvent, cb: any) => void
+  off: (type: RelayEvent, cb: any) => void
 }
 export type Pub = {
   on: (type: 'ok' | 'seen' | 'failed', cb: any) => void
@@ -31,13 +32,16 @@ type SubscriptionOptions = {
   id?: string
 }
 
-export function relayInit(url: string): Relay {
+export function relayInit(
+  url: string,
+  alreadyHaveEvent: (id: string) => boolean = () => false
+): Relay {
   var ws: WebSocket
-  var resolveOpen: () => void
   var resolveClose: () => void
-  var untilOpen: Promise<void>
-  var wasClosed: boolean
-  var closed: boolean
+  var setOpen: (value: PromiseLike<void> | void) => void
+  var untilOpen = new Promise<void>(resolve => {
+    setOpen = resolve
+  })
   var openSubs: {[id: string]: {filters: Filter[]} & SubscriptionOptions} = {}
   var listeners: {
     connect: Array<() => void>
@@ -63,130 +67,106 @@ export function relayInit(url: string): Relay {
       failed: Array<(reason: string) => void>
     }
   } = {}
-  let attemptNumber = 1
-  let nextAttemptSeconds = 1
-  let isConnected = false
 
-  function resetOpenState() {
-    untilOpen = new Promise(resolve => {
-      resolveOpen = resolve
+  async function connectRelay(): Promise<void> {
+    return new Promise((resolve, reject) => {
+      ws = new WebSocket(url)
+
+      ws.onopen = () => {
+        listeners.connect.forEach(cb => cb())
+        setOpen()
+        resolve()
+      }
+      ws.onerror = () => {
+        listeners.error.forEach(cb => cb())
+        reject()
+      }
+      ws.onclose = async () => {
+        listeners.disconnect.forEach(cb => cb())
+        resolveClose && resolveClose()
+      }
+
+      let incomingMessageQueue: string[] = []
+      let handleNextInterval: any
+
+      ws.onmessage = e => {
+        incomingMessageQueue.push(e.data)
+        if (!handleNextInterval) {
+          handleNextInterval = setInterval(handleNext, 0)
+        }
+      }
+
+      function handleNext() {
+        if (incomingMessageQueue.length === 0) {
+          clearInterval(handleNextInterval)
+          handleNextInterval = null
+          return
+        }
+
+        var json = incomingMessageQueue.shift()
+        if (!json || alreadyHaveEvent(getHex64(json, 'id'))) {
+          return
+        }
+
+        try {
+          let data = JSON.parse(json)
+
+          // we won't do any checks against the data since all failures (i.e. invalid messages from relays)
+          // will naturally be caught by the encompassing try..catch block
+
+          switch (data[0]) {
+            case 'EVENT':
+              let id = data[1]
+              let event = data[2]
+              if (
+                validateEvent(event) &&
+                openSubs[id] &&
+                (openSubs[id].skipVerification || verifySignature(event)) &&
+                matchFilters(openSubs[id].filters, event)
+              ) {
+                openSubs[id]
+                ;(subListeners[id]?.event || []).forEach(cb => cb(event))
+              }
+              return
+            case 'EOSE': {
+              let id = data[1]
+              ;(subListeners[id]?.eose || []).forEach(cb => cb())
+              return
+            }
+            case 'OK': {
+              let id: string = data[1]
+              let ok: boolean = data[2]
+              let reason: string = data[3] || ''
+              if (ok) pubListeners[id]?.ok.forEach(cb => cb())
+              else pubListeners[id]?.failed.forEach(cb => cb(reason))
+              return
+            }
+            case 'NOTICE':
+              let notice = data[1]
+              listeners.notice.forEach(cb => cb(notice))
+              return
+          }
+        } catch (err) {
+          return
+        }
+      }
     })
   }
 
-  function connectRelay() {
-    ws = new WebSocket(url)
-
-    ws.onopen = () => {
-      listeners.connect.forEach(cb => cb())
-      resolveOpen()
-      isConnected = true
-
-      // restablish old subscriptions
-      if (wasClosed) {
-        wasClosed = false
-        for (let id in openSubs) {
-          let {filters} = openSubs[id]
-          sub(filters, openSubs[id])
-        }
-      }
-    }
-    ws.onerror = () => {
-      isConnected = false
-      listeners.error.forEach(cb => cb())
-    }
-    ws.onclose = async () => {
-      isConnected = false
-      listeners.disconnect.forEach(cb => cb())
-
-      if (closed) {
-        // we've closed this because we wanted, so end everything
-        resolveClose()
-        return
-      }
-
-      // otherwise keep trying to reconnect
-      resetOpenState()
-      attemptNumber++
-      nextAttemptSeconds += attemptNumber ** 3
-      if (nextAttemptSeconds > 14400) {
-        nextAttemptSeconds = 14400 // 4 hours
-      }
-      console.log(
-        `relay ${url} connection closed. reconnecting in ${nextAttemptSeconds} seconds.`
-      )
-      setTimeout(async () => {
-        try {
-          connectRelay()
-        } catch (err) {}
-      }, nextAttemptSeconds * 1000)
-
-      wasClosed = true
-    }
-
-    ws.onmessage = async e => {
-      var data
-      try {
-        data = JSON.parse(e.data)
-      } catch (err) {
-        data = e.data
-      }
-
-      if (data.length >= 1) {
-        switch (data[0]) {
-          case 'EVENT':
-            if (data.length !== 3) return // ignore empty or malformed EVENT
-
-            let id = data[1]
-            let event = data[2]
-            if (
-              validateEvent(event) &&
-              openSubs[id] &&
-              (openSubs[id].skipVerification || verifySignature(event)) &&
-              matchFilters(openSubs[id].filters, event)
-            ) {
-              openSubs[id]
-              subListeners[id]?.event.forEach(cb => cb(event))
-            }
-            return
-          case 'EOSE': {
-            if (data.length !== 2) return // ignore empty or malformed EOSE
-            let id = data[1]
-            subListeners[id]?.eose.forEach(cb => cb())
-            return
-          }
-          case 'OK': {
-            if (data.length < 3) return // ignore empty or malformed OK
-            let id: string = data[1]
-            let ok: boolean = data[2]
-            let reason: string = data[3] || ''
-            if (ok) pubListeners[id]?.ok.forEach(cb => cb())
-            else pubListeners[id]?.failed.forEach(cb => cb(reason))
-            return
-          }
-          case 'NOTICE':
-            if (data.length !== 2) return // ignore empty or malformed NOTICE
-            let notice = data[1]
-            listeners.notice.forEach(cb => cb(notice))
-            return
-        }
-      }
-    }
-  }
-
-  resetOpenState()
-
   async function connect(): Promise<void> {
     if (ws?.readyState && ws.readyState === 1) return // ws already open
-    try {
-      connectRelay()
-    } catch (err) {}
+    await connectRelay()
   }
 
   async function trySend(params: [string, ...any]) {
     let msg = JSON.stringify(params)
 
     await untilOpen
-    ws.send(msg)
+    try {
+      ws.send(msg)
+    } catch (err) {
+      console.log(err)
+    }
   }
 
   const sub = (
@@ -224,8 +204,9 @@ export function relayInit(url: string): Relay {
         subListeners[subid][type].push(cb)
       },
       off: (type: 'event' | 'eose', cb: any): void => {
-        let idx = subListeners[subid][type].indexOf(cb)
-        if (idx >= 0) subListeners[subid][type].splice(idx, 1)
+        let listeners = subListeners[subid]
+        let idx = listeners[type].indexOf(cb)
+        if (idx >= 0) listeners[type].splice(idx, 1)
       }
     }
   }
@@ -233,13 +214,13 @@ export function relayInit(url: string): Relay {
   return {
     url,
     sub,
-    on: (type: 'connect' | 'disconnect' | 'notice', cb: any): void => {
+    on: (type: RelayEvent, cb: any): void => {
       listeners[type].push(cb)
-      if (type === 'connect' && isConnected) {
+      if (type === 'connect' && ws?.readyState === 1) {
         cb()
       }
     },
-    off: (type: 'connect' | 'disconnect' | 'notice', cb: any): void => {
+    off: (type: RelayEvent, cb: any): void => {
       let index = listeners[type].indexOf(cb)
       if (index !== -1) listeners[type].splice(index, 1)
     },
@@ -265,14 +246,14 @@ export function relayInit(url: string): Relay {
           id: `monitor-${id.slice(0, 5)}`
         })
         let willUnsub = setTimeout(() => {
-          pubListeners[id].failed.forEach(cb =>
+          ;(pubListeners[id]?.failed || []).forEach(cb =>
             cb('event not seen after 5 seconds')
           )
           monitor.unsub()
         }, 5000)
         monitor.on('event', () => {
           clearTimeout(willUnsub)
-          pubListeners[id].seen.forEach(cb => cb())
+          ;(pubListeners[id]?.seen || []).forEach(cb => cb())
         })
       }
 
@@ -291,21 +272,22 @@ export function relayInit(url: string): Relay {
           }
         },
         off: (type: 'ok' | 'seen' | 'failed', cb: any) => {
-          let idx = pubListeners[id][type].indexOf(cb)
-          if (idx >= 0) pubListeners[id][type].splice(idx, 1)
+          let listeners = pubListeners[id]
+          if (!listeners) return
+          let idx = listeners[type].indexOf(cb)
+          if (idx >= 0) listeners[type].splice(idx, 1)
         }
       }
     },
     connect,
     close(): Promise<void> {
-      closed = true // prevent ws from trying to reconnect
       ws.close()
-      return new Promise(resolve => {
+      return new Promise<void>(resolve => {
         resolveClose = resolve
       })
     },
     get status() {
-      return ws.readyState
+      return ws?.readyState ?? 3
     }
   }
 }
